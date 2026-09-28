@@ -195,6 +195,62 @@ export function getIsExtracting(): boolean {
 export function getIsApplying(): boolean {
     return isApplying;
 }
+// The backend copies every background into a single flat `backgrounds/`
+// directory, so two wallpapers with the same filename cannot coexist in one
+// theme — it aborts the apply with a basename collision. Dedupe by full path
+// and by basename (first entry wins, including the primary wallpaper) before
+// the list can reach the backend.
+export function imageBasename(path: string): string {
+    return path.split(/[\\/]/).pop() ?? path;
+}
+
+export function dedupeAdditionalImages(
+    images: readonly string[],
+    primaryWallpaper: string
+): string[] {
+    const seenPaths = new Set<string>();
+    const seenNames = new Set<string>();
+    if (primaryWallpaper) {
+        seenPaths.add(primaryWallpaper);
+        seenNames.add(imageBasename(primaryWallpaper));
+    }
+    const unique: string[] = [];
+    for (const image of images) {
+        if (!image) continue;
+        const name = imageBasename(image);
+        if (seenPaths.has(image) || seenNames.has(name)) continue;
+        seenPaths.add(image);
+        seenNames.add(name);
+        unique.push(image);
+    }
+    return unique;
+}
+
+function sameStringList(a: readonly string[], b: readonly string[]): boolean {
+    return (
+        a.length === b.length && a.every((value, index) => value === b[index])
+    );
+}
+
+// Order-independent comparison for values pushed from the backend. Keeping
+// `applyBackendState` from rewriting identical maps/slices stops it re-arming
+// App's SyncState `$effect` with an unchanged snapshot.
+function sameSerialized(a: unknown, b: unknown): boolean {
+    return stableStringify(a) === stableStringify(b);
+}
+
+function stableStringify(value: unknown): string {
+    return JSON.stringify(value, (_key, val: unknown) =>
+        val && typeof val === 'object' && !Array.isArray(val)
+            ? Object.fromEntries(
+                  Object.entries(val as Record<string, unknown>).sort(
+                      ([a], [b]) => a.localeCompare(b)
+                  )
+              )
+            : val
+    );
+}
+
 export function getAdditionalImages(): string[] {
     return additionalImages;
 }
@@ -249,6 +305,13 @@ export function restoreHistorySnapshot(snapshot: Snapshot): void {
     wallpaperBlur = restored.wallpaperBlur;
     blurPreview = null;
     wallpaperRevision++;
+    // An undo can bring back a main wallpaper whose filename matches a staged
+    // additional image; drop those entries so the restored state still applies.
+    const kept = dedupeAdditionalImages(
+        additionalImages,
+        restored.wallpaperPath
+    );
+    if (!sameStringList(kept, additionalImages)) additionalImages = kept;
     palette = restored.palette;
     basePalette = restored.basePalette;
     extendedColors = restored.extendedColors;
@@ -644,6 +707,10 @@ export function setWallpaperPath(path: string): void {
     blurPreview = null;
     invalidateThemeRequests(false);
     wallpaperPath = path;
+    // An additional image whose filename matches the new wallpaper can never be
+    // staged alongside it, so drop it instead of failing the whole apply.
+    const kept = dedupeAdditionalImages(additionalImages, path);
+    if (!sameStringList(kept, additionalImages)) additionalImages = kept;
 }
 export function setLightMode(enabled: boolean): void {
     invalidateThemeRequests(false);
@@ -669,15 +736,24 @@ export function setIsApplying(v: boolean): void {
 }
 
 export function setAdditionalImages(images: string[]): void {
+    const unique = dedupeAdditionalImages(images, wallpaperPath);
+    if (sameStringList(unique, additionalImages)) return;
     invalidateThemeRequests(false);
-    additionalImages = [...images];
+    additionalImages = unique;
 }
 
-export function addAdditionalImage(path: string): void {
-    if (!additionalImages.includes(path)) {
-        invalidateThemeRequests(false);
-        additionalImages = [...additionalImages, path];
-    }
+// Returns false when the image duplicates an existing path or filename, or
+// collides with the main wallpaper's filename — the backend rejects such a set.
+export function addAdditionalImage(path: string): boolean {
+    if (!path || path === wallpaperPath) return false;
+    if (additionalImages.includes(path)) return false;
+    const name = imageBasename(path);
+    if (wallpaperPath && name === imageBasename(wallpaperPath)) return false;
+    if (additionalImages.some(image => imageBasename(image) === name))
+        return false;
+    invalidateThemeRequests(false);
+    additionalImages = [...additionalImages, path];
+    return true;
 }
 
 export function removeAdditionalImage(path: string): void {
@@ -690,14 +766,76 @@ export function swapMainWithAdditional(path: string): void {
     if (idx === -1) return;
     invalidateThemeRequests(false);
     const oldMain = wallpaperPath;
-    setWallpaperPath(path);
     const next = [...additionalImages];
     if (oldMain) {
         next[idx] = oldMain;
     } else {
         next.splice(idx, 1);
     }
-    additionalImages = next;
+    setWallpaperPath(path);
+    const unique = dedupeAdditionalImages(next, path);
+    if (!sameStringList(unique, additionalImages)) additionalImages = unique;
+}
+
+// Shape of the editor snapshot the Go backend pushes over the
+// `ipc-state-changed` Wails event for IPC remote control.
+export interface BackendStatePayload {
+    palette?: string[];
+    extendedColors?: Record<string, string>;
+    nativeColors?: Record<string, string>;
+    iconTheme?: {mode?: string; id?: string};
+    lightMode?: boolean;
+    mode?: string;
+    wallpaper?: string;
+    wallpaperBlur?: boolean;
+    adjustments?: Adjustments;
+    appOverrides?: Record<string, Record<string, string>>;
+    additionalImages?: string[];
+}
+
+// Mirrors a backend-pushed snapshot into local state. Values that already match
+// local state are skipped: rewriting equal arrays/objects re-ran App's
+// SyncState `$effect`, which pushed the same snapshot straight back to Go and
+// froze the GUI in an endless frontend <-> backend loop (issue #130).
+export function applyBackendState(state: BackendStatePayload): void {
+    if (
+        state.palette &&
+        state.palette.length >= 16 &&
+        !sameSerialized(state.palette, palette)
+    ) {
+        setPalette(state.palette);
+    }
+    if (
+        state.extendedColors &&
+        !sameSerialized(state.extendedColors, extendedColors)
+    ) {
+        setExtendedColors(state.extendedColors);
+    }
+    if (
+        state.nativeColors &&
+        !sameSerialized(state.nativeColors, nativeColors)
+    ) {
+        setNativeColors(state.nativeColors);
+    }
+    if (state.iconTheme) setIconTheme(state.iconTheme, true);
+    if (state.lightMode !== undefined) setLightMode(state.lightMode);
+    if (state.mode) setExtractionMode(state.mode);
+    if (state.wallpaper !== undefined && state.wallpaper !== wallpaperPath) {
+        setWallpaperPath(state.wallpaper);
+    }
+    if (state.wallpaperBlur !== undefined) {
+        setWallpaperBlur(state.wallpaperBlur, true);
+    }
+    if (state.adjustments && !sameSerialized(state.adjustments, adjustments)) {
+        setAdjustments(state.adjustments);
+    }
+    if (
+        state.appOverrides &&
+        !sameSerialized(state.appOverrides, appOverrides)
+    ) {
+        setAppOverrides(state.appOverrides);
+    }
+    if (state.additionalImages) setAdditionalImages(state.additionalImages);
 }
 
 // --- Shuffle (experimental) ---

@@ -43,8 +43,11 @@
             );
             const path = await OpenFileDialog();
             if (path) {
-                addAdditionalImage(path);
-                showToast('Image added');
+                showToast(
+                    addAdditionalImage(path)
+                        ? 'Image added'
+                        : 'Skipped — another wallpaper already uses that filename'
+                );
             }
         } catch {}
     }
