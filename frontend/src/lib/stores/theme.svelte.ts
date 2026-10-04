@@ -15,6 +15,7 @@ import {
     type Snapshot,
 } from '$lib/stores/history.svelte';
 import {debounce} from '$lib/utils/debounce';
+import {showToast} from '$lib/stores/ui.svelte';
 import {buildCurveLUT, applyCurveToColors} from '$lib/utils/canvas-filters';
 
 // Extraction follows this revision. Adjustment jobs are invalidated separately
@@ -196,10 +197,10 @@ export function getIsApplying(): boolean {
     return isApplying;
 }
 // The backend copies every background into a single flat `backgrounds/`
-// directory, so two wallpapers with the same filename cannot coexist in one
-// theme — it aborts the apply with a basename collision. Dedupe by full path
-// and by basename (first entry wins, including the primary wallpaper) before
-// the list can reach the backend.
+// directory. Two different files with the same filename cannot coexist in one
+// theme, and the backend rejects the apply with a basename collision. Dedupe
+// by full path and by basename before the list reaches the backend. The first
+// entry wins, and the primary wallpaper counts as the first entry.
 export function imageBasename(path: string): string {
     return path.split(/[\\/]/).pop() ?? path;
 }
@@ -230,6 +231,24 @@ function sameStringList(a: readonly string[], b: readonly string[]): boolean {
     return (
         a.length === b.length && a.every((value, index) => value === b[index])
     );
+}
+
+// Drops additional images that collide with a new main wallpaper. History
+// snapshots do not hold additional images, so undo cannot bring them back.
+// Tell the user about each different file that was dropped.
+function dropImagesCollidingWith(primary: string): void {
+    const kept = dedupeAdditionalImages(additionalImages, primary);
+    if (sameStringList(kept, additionalImages)) return;
+    const dropped = additionalImages.filter(
+        image => image !== primary && !kept.includes(image)
+    );
+    additionalImages = kept;
+    if (dropped.length > 0) {
+        const noun = dropped.length === 1 ? 'image' : 'images';
+        showToast(
+            `Removed ${dropped.length} additional ${noun} with the same filename as the main wallpaper`
+        );
+    }
 }
 
 // Order-independent comparison for values pushed from the backend. Keeping
@@ -305,13 +324,9 @@ export function restoreHistorySnapshot(snapshot: Snapshot): void {
     wallpaperBlur = restored.wallpaperBlur;
     blurPreview = null;
     wallpaperRevision++;
-    // An undo can bring back a main wallpaper whose filename matches a staged
-    // additional image; drop those entries so the restored state still applies.
-    const kept = dedupeAdditionalImages(
-        additionalImages,
-        restored.wallpaperPath
-    );
-    if (!sameStringList(kept, additionalImages)) additionalImages = kept;
+    // An undo can bring back a main wallpaper whose filename matches an
+    // additional image. Drop those entries so the restored state still applies.
+    dropImagesCollidingWith(restored.wallpaperPath);
     palette = restored.palette;
     basePalette = restored.basePalette;
     extendedColors = restored.extendedColors;
@@ -709,8 +724,7 @@ export function setWallpaperPath(path: string): void {
     wallpaperPath = path;
     // An additional image whose filename matches the new wallpaper can never be
     // staged alongside it, so drop it instead of failing the whole apply.
-    const kept = dedupeAdditionalImages(additionalImages, path);
-    if (!sameStringList(kept, additionalImages)) additionalImages = kept;
+    dropImagesCollidingWith(path);
 }
 export function setLightMode(enabled: boolean): void {
     invalidateThemeRequests(false);
@@ -742,17 +756,17 @@ export function setAdditionalImages(images: string[]): void {
     additionalImages = unique;
 }
 
-// Returns false when the image duplicates an existing path or filename, or
-// collides with the main wallpaper's filename — the backend rejects such a set.
+// Returns false when the image repeats a path or a filename that the theme
+// already uses, including the main wallpaper.
 export function addAdditionalImage(path: string): boolean {
-    if (!path || path === wallpaperPath) return false;
-    if (additionalImages.includes(path)) return false;
-    const name = imageBasename(path);
-    if (wallpaperPath && name === imageBasename(wallpaperPath)) return false;
-    if (additionalImages.some(image => imageBasename(image) === name))
-        return false;
+    if (!path || additionalImages.includes(path)) return false;
+    const next = dedupeAdditionalImages(
+        [...additionalImages, path],
+        wallpaperPath
+    );
+    if (!next.includes(path)) return false;
     invalidateThemeRequests(false);
-    additionalImages = [...additionalImages, path];
+    additionalImages = next;
     return true;
 }
 
@@ -793,10 +807,9 @@ export interface BackendStatePayload {
     additionalImages?: string[];
 }
 
-// Mirrors a backend-pushed snapshot into local state. Values that already match
-// local state are skipped: rewriting equal arrays/objects re-ran App's
-// SyncState `$effect`, which pushed the same snapshot straight back to Go and
-// froze the GUI in an endless frontend <-> backend loop (issue #130).
+// Mirrors a backend-pushed snapshot into local state. Values that already
+// match local state are skipped, so an equal push does not cancel pending
+// theme requests or send the same snapshot back to Go.
 export function applyBackendState(state: BackendStatePayload): void {
     if (
         state.palette &&

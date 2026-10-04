@@ -46,7 +46,7 @@
                 showToast(
                     addAdditionalImage(path)
                         ? 'Image added'
-                        : 'Skipped — another wallpaper already uses that filename'
+                        : 'Skipped: the theme already has a wallpaper with that filename'
                 );
             }
         } catch {}
@@ -75,7 +75,9 @@
 
     {#if getAdditionalImages().length > 0}
         <div class="grid grid-cols-4 gap-1.5">
-            {#each getAdditionalImages() as img (img)}
+            <!-- Unkeyed on purpose. A keyed each throws on a repeated path,
+                 and that error stopped every later effect (issue #130). -->
+            {#each getAdditionalImages() as img}
                 <div
                     class="border-border bg-bg-primary group relative aspect-video overflow-hidden border"
                 >

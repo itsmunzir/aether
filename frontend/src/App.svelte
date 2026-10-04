@@ -154,9 +154,8 @@
             .catch(() => {});
     }, STATE_SYNC_DEBOUNCE_MS);
 
-    // Only snapshots that differ from the last mirrored state are dispatched.
-    // Re-sending an identical snapshot on every backend echo is what let the
-    // frontend and Go ping-pong state until the window froze (issue #130).
+    // Send only snapshots that differ from the last mirrored state, so a
+    // backend push of equal values does not cause another SyncState call.
     let lastSyncedSignature = '';
     $effect(() => {
         const snapshot = getThemeSnapshot();

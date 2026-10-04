@@ -2,7 +2,11 @@ import {beforeEach, expect, test, vi} from 'vitest';
 import {flushSync} from 'svelte';
 import App from '../src/App.svelte';
 import * as theme from '../src/lib/stores/theme.svelte';
-import {getLivePending, setLiveApply} from '../src/lib/stores/ui.svelte';
+import {
+    getLivePending,
+    setLiveApply,
+    showToast,
+} from '../src/lib/stores/ui.svelte';
 import {loadBlueprintIntoEditor} from '../src/lib/actions/blueprintActions';
 import {initOmarchyCapabilities} from '$lib/stores/omarchy.svelte';
 import {ApplyTheme, GetInitialState, SyncState} from '../wailsjs/go/main/App';
@@ -104,6 +108,10 @@ vi.mock('../wailsjs/go/main/App', () => ({
     ApplyTheme: vi.fn(),
     SaveAndApplyTheme: vi.fn(),
 }));
+vi.mock('../src/lib/stores/ui.svelte', async importOriginal => ({
+    ...(await importOriginal<typeof import('../src/lib/stores/ui.svelte')>()),
+    showToast: vi.fn(),
+}));
 vi.mock('../wailsjs/runtime/runtime', () => ({
     WindowShow: vi.fn(),
     WindowSetBackgroundColour: vi.fn(),
@@ -120,6 +128,7 @@ beforeEach(() => {
     theme.setIsApplying(false);
     theme.setIsExtracting(false);
     setLiveApply(false);
+    vi.mocked(showToast).mockClear();
     vi.mocked(ApplyTheme).mockReset().mockResolvedValue(success);
     vi.mocked(SyncState).mockReset().mockResolvedValue(undefined);
     vi.mocked(GetInitialState)
@@ -177,6 +186,9 @@ test('changing the main wallpaper drops additional images that would collide', (
     theme.setWallpaperPath('/w/second.png');
 
     expect(theme.getAdditionalImages()).toEqual(['/other/keep.png']);
+    expect(showToast).toHaveBeenCalledWith(
+        'Removed 1 additional image with the same filename as the main wallpaper'
+    );
 });
 
 test('swapping keeps the previous main wallpaper as an additional image', () => {
@@ -191,6 +203,7 @@ test('swapping keeps the previous main wallpaper as an additional image', () => 
         '/other/extra.png',
         '/w/main.png',
     ]);
+    expect(showToast).not.toHaveBeenCalled();
 });
 
 test('a duplicate-basename import applies once with unique names', async () => {
